@@ -106,6 +106,272 @@
 <div class="wrap">
   <section class="console">
     <div>
+      <p class="eyebrow">Speech &rarr; Text &middot; Gemini</p>
+      <h1>Soundboard <span class="thin">/ transcriber</span></h1>
+      <p class="sub">Drop an audio file and Gemini returns a clean transcript. The key is held by this site's server function &mdash; it never reaches your browser or the repo.</p>
+    </div>
+
+    <div class="serverline"><span class="dot"></span> Key held server-side &middot; routed through this site</div>
+
+    <div class="row2">
+      <div class="field">
+        <label class="cap" for="model">Model</label>
+        <input id="model" type="text" value="gemini-2.5-flash" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label class="cap">Quick pick</label>
+        <div class="chips">
+          <span class="chip" data-model="gemini-2.5-flash">flash</span>
+          <span class="chip" data-model="gemini-2.5-pro">pro</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="cap">Transcript options</label>
+      <div class="chips" id="opts">
+        <span class="chip" data-opt="verbatim" aria-pressed="true">verbatim</span>
+        <span class="chip" data-opt="speakers" aria-pressed="true">speaker labels</span>
+        <span class="chip" data-opt="timestamps" aria-pressed="false">timestamps</span>
+        <span class="chip" data-opt="summary" aria-pressed="false">summary</span>
+        <span class="chip" data-opt="translate" aria-pressed="false">translate &rarr; EN</span>
+      </div>
+    </div>
+
+    <details>
+      <summary>Edit prompt</summary>
+      <div class="field" style="margin-top:12px;">
+        <textarea id="prompt"></textarea>
+        <p class="hint">Toggling options rewrites this. Edit freely to take manual control.</p>
+      </div>
+    </details>
+
+    <div class="field">
+      <label class="cap">Audio file</label>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept=".mp3,.wav,.aac,.ogg,.flac,.aiff,.aif,.m4a,audio/*" />
+        <div class="prompt-state">
+          <div class="wave" id="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          <div class="big">Drop audio or tap to browse</div>
+          <div class="small">WAV &middot; MP3 &middot; AAC &middot; OGG &middot; FLAC &middot; AIFF &mdash; up to 100 MB</div>
+        </div>
+        <div class="filemeta">
+          <div class="fname" id="fname"></div>
+          <div class="stats" id="fstats"></div>
+          <button class="clearfile" id="clear" type="button">remove</button>
+        </div>
+      </label>
+    </div>
+
+    <button class="go" id="go" disabled>Transcribe</button>
+    <div class="status" id="status">Idle &mdash; add a file to begin.</div>
+  </section>
+
+  <section class="paper">
+    <div class="paper-head">
+      <span class="t">Transcript</span>
+      <div class="paper-actions">
+        <span class="meter" id="meter"></span>
+        <button id="copy" disabled>Copy</button>
+        <button id="dl" disabled>Download .txt</button>
+      </div>
+    </div>
+    <div class="transcript empty" id="out">Your transcript will appear here.</div>
+  </section>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  const $=id=>document.getElementById(id);
+  const modelEl=$("model"),fileEl=$("file"),drop=$("drop"),go=$("go"),
+        statusEl=$("status"),out=$("out"),promptEl=$("prompt"),wave=$("wave"),meter=$("meter");
+  const MAX=100*1024*1024;
+  let current=null;
+
+  const opts={verbatim:true,speakers:true,timestamps:false,summary:false,translate:false};
+  function buildPrompt(){
+    const l=[];
+    if(opts.summary) l.push('Begin with a one-paragraph summary headed "SUMMARY:".');
+    let core="Transcribe the speech in this audio";
+    if(opts.verbatim) core+=" verbatim, preserving the speaker's wording";
+    core+="."; l.push(core);
+    if(opts.speakers) l.push("Label distinct speakers as Speaker 1, Speaker 2, etc.");
+    if(opts.timestamps) l.push("Prefix each segment with a timestamp in [MM:SS] format.");
+    if(opts.translate) l.push("If any speech is not in English, follow it with an English translation in (parentheses).");
+    l.push("Return only the transcript text - no commentary, no markdown.");
+    return l.join("\n");
+  }
+  function syncPrompt(){promptEl.value=buildPrompt();}
+  syncPrompt();
+  $("opts").addEventListener("click",e=>{
+    const c=e.target.closest(".chip"); if(!c) return;
+    const k=c.dataset.opt; opts[k]=!(c.getAttribute("aria-pressed")==="true");
+    c.setAttribute("aria-pressed",opts[k]); syncPrompt();
+  });
+  document.querySelectorAll(".chip[data-model]").forEach(c=>{
+    c.addEventListener("click",()=>{modelEl.value=c.dataset.model;});
+  });
+
+  function fmtBytes(b){if(b<1024)return b+" B";if(b<1048576)return(b/1024).toFixed(0)+" KB";return(b/1048576).toFixed(2)+" MB";}
+  function fmtDur(s){if(!s||!isFinite(s))return "-";const m=Math.floor(s/60),ss=Math.round(s%60);return m+":"+String(ss).padStart(2,"0");}
+  function setStatus(m,k){statusEl.textContent=m;statusEl.className="status"+(k?" "+k:"");}
+  function ready(){go.disabled=!current;}
+
+  function readDuration(file){
+    return new Promise(res=>{
+      try{const url=URL.createObjectURL(file);const a=new Audio();a.preload="metadata";
+        a.onloadedmetadata=()=>{URL.revokeObjectURL(url);res(a.duration);};
+        a.onerror=()=>{URL.revokeObjectURL(url);res(null);};a.src=url;
+      }catch(_){res(null);}
+    });
+  }
+  async function intake(file){
+    if(!file) return;
+    if(file.size>MAX){setStatus("File is "+fmtBytes(file.size)+" — over the 100 MB site limit. Use the Colab notebook for longer audio.","err");return;}
+    const seconds=await readDuration(file);
+    current={file,seconds};
+    $("fname").textContent=file.name;
+    const tokens=seconds?Math.round(seconds*32):null;
+    $("fstats").innerHTML=
+      "<span>SIZE <b>"+fmtBytes(file.size)+"</b></span>"+
+      "<span>LENGTH <b>"+fmtDur(seconds)+"</b></span>"+
+      (tokens?"<span>~TOKENS <b>"+tokens.toLocaleString()+"</b></span>":"");
+    drop.classList.add("loaded"); setStatus("Ready to transcribe.","ok"); ready();
+  }
+  fileEl.addEventListener("change",e=>intake(e.target.files[0]));
+  ["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("hot");}));
+  ["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("hot");}));
+  drop.addEventListener("drop",e=>{if(e.dataTransfer.files[0])intake(e.dataTransfer.files[0]);});
+  $("clear").addEventListener("click",e=>{e.preventDefault();e.stopPropagation();
+    current=null;fileEl.value="";drop.classList.remove("loaded");setStatus("File removed.");ready();});
+
+  function render(text){
+    const esc=text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    const html=esc
+      .replace(/\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g,'<span class="ts">[$1]</span>')
+      .replace(/^(\s*Speaker\s*\d+\s*:?)/gmi,'<span class="spk">$1</span>');
+    out.classList.remove("empty"); out.innerHTML=html;
+  }
+
+  go.addEventListener("click",async()=>{
+    if(!current) return;
+    const model=modelEl.value.trim()||"gemini-2.5-flash";
+    go.disabled=true; wave.classList.add("run");
+    setStatus("Uploading "+fmtDur(current.seconds)+" of audio...");
+    out.classList.add("empty"); out.textContent="Transcribing...";
+    meter.textContent=""; $("copy").disabled=true; $("dl").disabled=true;
+
+    const fd=new FormData();
+    fd.append("audio",current.file);
+    fd.append("prompt",promptEl.value.trim()||buildPrompt());
+    fd.append("model",model);
+
+    const t0=performance.now();
+    try{
+      const res=await fetch("/api/transcribe",{method:"POST",body:fd});
+      const data=await res.json();
+      if(!res.ok) throw new Error(data.error||("HTTP "+res.status));
+      render(data.text); window.__transcript=data.text;
+      const secs=((performance.now()-t0)/1000).toFixed(1);
+      meter.textContent=data.tokens?data.tokens.toLocaleString()+" tokens · "+secs+"s":secs+"s";
+      setStatus("Done.","ok"); $("copy").disabled=false; $("dl").disabled=false;
+    }catch(err){
+      out.classList.add("empty"); out.textContent="Nothing transcribed.";
+      let h=err.message||String(err);
+      if(/Failed to fetch|Load failed|NetworkError/i.test(h)) h="Could not reach the transcribe function. Is the site deployed with Functions enabled?";
+      setStatus(h,"err");
+    }finally{ go.disabled=false; wave.classList.remove("run"); ready(); }
+  });
+
+  $("copy").addEventListener("click",async()=>{
+    if(!window.__transcript) return;
+    try{await navigator.clipboard.writeText(window.__transcript);
+      $("copy").textContent="Copied";setTimeout(()=>$("copy").textContent="Copy",1400);
+    }catch(_){setStatus("Copy blocked - select the text manually.","err");}
+  });
+  $("dl").addEventListener("click",()=>{
+    if(!window.__transcript) return;
+    const name=(current&&current.file.name.replace(/\.[^.]+$/,""))||"transcript";
+    const blob=new Blob([window.__transcript],{type:"text/plain"});
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name+".txt";
+    a.click();URL.revokeObjectURL(a.href);
+  });
+})();
+</script>
+</body>
+</html>  input:focus,textarea:focus{border-color:var(--signal);box-shadow:0 0 0 3px var(--signal-dim);}
+  .hint{font-size:11.5px;color:var(--muted);line-height:1.45;}
+  .serverline{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    background:var(--console);border:1px solid var(--line);border-radius:9px;padding:10px 12px;}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--teal);box-shadow:0 0 0 3px rgba(95,176,164,.18);flex:none;}
+
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;}
+  .chip{font-family:var(--mono);font-size:11px;letter-spacing:.04em;padding:7px 11px;border-radius:999px;cursor:pointer;
+    user-select:none;background:var(--console-2);border:1px solid var(--line);color:var(--muted);transition:.13s;}
+  .chip[aria-pressed=true]{background:var(--signal-dim);border-color:var(--signal);color:var(--signal);}
+  details{border-top:1px solid var(--line);padding-top:14px;}
+  summary{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);cursor:pointer;list-style:none;}
+  summary::-webkit-details-marker{display:none;}
+  summary::before{content:"+ ";color:var(--signal);}
+  details[open] summary::before{content:"- ";}
+
+  .drop{position:relative;border:1.5px dashed var(--line-strong);border-radius:13px;background:var(--console);
+    padding:26px 20px;text-align:center;cursor:pointer;transition:.16s;}
+  .drop.hot{border-color:var(--signal);background:var(--signal-dim);}
+  .drop.loaded{border-style:solid;border-color:var(--teal);cursor:default;}
+  .drop .big{font-size:14.5px;font-weight:500;}
+  .drop .small{font-size:11.5px;color:var(--muted);margin-top:5px;font-family:var(--mono);}
+  .drop input[type=file]{display:none;}
+  .filemeta{display:none;text-align:left;}
+  .drop.loaded .prompt-state{display:none;}
+  .drop.loaded .filemeta{display:block;}
+  .filemeta .fname{font-size:14px;font-weight:600;word-break:break-all;}
+  .filemeta .stats{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:8px;display:flex;flex-wrap:wrap;gap:4px 14px;}
+  .filemeta .stats b{color:var(--teal);font-weight:600;}
+  .clearfile{margin-top:12px;background:transparent;border:1px solid var(--line);color:var(--muted);
+    border-radius:9px;padding:6px 12px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:.15s;}
+  .clearfile:hover{color:var(--bright);border-color:var(--line-strong);}
+
+  .wave{display:flex;align-items:flex-end;justify-content:center;gap:3px;height:30px;margin:0 auto 14px;}
+  .wave i{width:3px;background:var(--signal);border-radius:2px;height:6px;opacity:.5;animation:idle 1.8s ease-in-out infinite;}
+  .wave.run i{animation:run .7s ease-in-out infinite;opacity:1;}
+  @keyframes idle{0%,100%{height:6px}50%{height:13px}}
+  @keyframes run{0%,100%{height:5px}50%{height:26px}}
+  .wave i:nth-child(2){animation-delay:.1s}.wave i:nth-child(3){animation-delay:.2s}
+  .wave i:nth-child(4){animation-delay:.3s}.wave i:nth-child(5){animation-delay:.15s}
+  .wave i:nth-child(6){animation-delay:.25s}.wave i:nth-child(7){animation-delay:.05s}
+
+  .go{width:100%;border:none;border-radius:11px;cursor:pointer;background:var(--signal);color:#241803;
+    font-weight:650;font-size:15px;padding:14px;letter-spacing:.01em;transition:.15s;font-family:var(--sans);}
+  .go:hover:not(:disabled){filter:brightness(1.06);}
+  .go:disabled{opacity:.4;cursor:not-allowed;}
+  .status{font-family:var(--mono);font-size:12px;min-height:17px;color:var(--muted);}
+  .status.err{color:var(--danger);} .status.ok{color:var(--teal);}
+
+  .paper{background:var(--paper);color:var(--ink-on-paper);padding:30px 34px 60px;display:flex;flex-direction:column;gap:18px;min-height:100vh;}
+  @media (max-width:880px){.paper{min-height:auto;}}
+  .paper-head{display:flex;align-items:baseline;justify-content:space-between;border-bottom:1px solid var(--paper-line);
+    padding-bottom:14px;gap:12px;flex-wrap:wrap;}
+  .paper-head .t{font-family:var(--mono);font-size:11px;letter-spacing:.24em;text-transform:uppercase;color:#9a937f;}
+  .paper-actions{display:flex;gap:8px;align-items:center;}
+  .paper-actions button{font-family:var(--mono);font-size:11px;letter-spacing:.04em;background:transparent;
+    border:1px solid var(--paper-line);color:#6b6452;border-radius:8px;padding:7px 12px;cursor:pointer;transition:.14s;}
+  .paper-actions button:hover:not(:disabled){background:#ece7db;color:var(--ink-on-paper);}
+  .paper-actions button:disabled{opacity:.4;cursor:not-allowed;}
+  .transcript{font-size:16px;line-height:1.72;white-space:pre-wrap;word-wrap:break-word;flex:1;}
+  .transcript.empty{color:#a59c87;font-style:italic;display:flex;align-items:center;justify-content:center;text-align:center;
+    border:1px dashed var(--paper-line);border-radius:12px;min-height:240px;font-size:14px;}
+  .transcript .ts{font-family:var(--mono);font-size:12.5px;color:#b07d2a;font-style:normal;}
+  .transcript .spk{font-weight:700;}
+  .meter{font-family:var(--mono);font-size:11px;color:#9a937f;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="console">
+    <div>
       <p class="eyebrow">Speech → Text · Gemini</p>
       <h1>Soundboard <span class="thin">/ transcriber</span></h1>
       <p class="sub">Drop an audio file and Gemini returns a clean transcript. The key is held by this site's server function — it never reaches your browser or the repo.</p>
