@@ -25,6 +25,37 @@ export async function onRequestPost({ request, env }) {
   const key = env.GEMINI_API_KEY;
   if (!key) return json({ error: "GEMINI_API_KEY is not set on the server." }, 500);
 
+  // Authentication check
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return json({ error: "Unauthorized: Missing or invalid Authorization header." }, 401);
+  }
+
+  const token = authHeader.split(" ")[1];
+  let tokenInfo;
+  try {
+    const tokenRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`);
+    tokenInfo = await tokenRes.json();
+    if (!tokenRes.ok) {
+      return json({ error: "Unauthorized: Invalid or expired Google ID token." }, 401);
+    }
+  } catch (e) {
+    return json({ error: "Unauthorized: Failed to verify token." }, 401);
+  }
+
+  const clientId = env.GOOGLE_CLIENT_ID;
+  if (!clientId || tokenInfo.aud !== clientId) {
+    return json({ error: "Unauthorized: Token audience mismatch or client ID not configured." }, 401);
+  }
+
+  const allowedEmailsStr = env.ALLOWED_EMAILS || "";
+  const allowedEmails = allowedEmailsStr.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+  const userEmail = (tokenInfo.email || "").toLowerCase();
+
+  if (!userEmail || !allowedEmails.includes(userEmail)) {
+    return json({ error: "Forbidden: Email not in the allowlist or not provided in token." }, 403);
+  }
+
   let form;
   try {
     form = await request.formData();
