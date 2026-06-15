@@ -44,16 +44,16 @@ export async function onRequestPost({ request, env }) {
   }
 
   const clientId = env.GOOGLE_CLIENT_ID;
-  if (tokenInfo.aud !== clientId) {
-    return json({ error: "Unauthorized: Token audience mismatch." }, 401);
+  if (!clientId || tokenInfo.aud !== clientId) {
+    return json({ error: "Unauthorized: Token audience mismatch or client ID not configured." }, 401);
   }
 
   const allowedEmailsStr = env.ALLOWED_EMAILS || "";
   const allowedEmails = allowedEmailsStr.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
   const userEmail = (tokenInfo.email || "").toLowerCase();
 
-  if (!allowedEmails.includes(userEmail)) {
-    return json({ error: "Forbidden: Email not in the allowlist." }, 403);
+  if (!userEmail || !allowedEmails.includes(userEmail)) {
+    return json({ error: "Forbidden: Email not in the allowlist or not provided in token." }, 403);
   }
 
   let form;
