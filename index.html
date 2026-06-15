@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Soundboard — Gemini Audio Transcription</title>
+<script src="https://accounts.google.com/gsi/client?onload=onGoogleLibraryLoad" async defer></script>
 <style>
   :root{
     --ink:#15171D; --console:#1C1F27; --console-2:#23262F;
@@ -39,6 +40,18 @@
   .serverline{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11.5px;color:var(--muted);
     background:var(--console);border:1px solid var(--line);border-radius:9px;padding:10px 12px;}
   .dot{width:8px;height:8px;border-radius:50%;background:var(--teal);box-shadow:0 0 0 3px rgba(95,176,164,.18);flex:none;}
+
+  .auth-section{margin-top:14px;background:var(--console-2);border:1px solid var(--line);border-radius:9px;padding:14px 16px;display:flex;align-items:center;min-height:68px;}
+  .auth-section.signed-in{justify-content:space-between;}
+  .auth-section.signed-out{justify-content:center;}
+  .user-info{display:none;font-family:var(--mono);font-size:12px;color:var(--bright);align-items:center;gap:12px;width:100%;justify-content:space-between;}
+  .user-info.active{display:flex;}
+  .user-email{font-weight:600;}
+  .sign-out{background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:6px;padding:5px 12px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:.15s;}
+  .sign-out:hover{color:var(--bright);border-color:var(--line-strong);}
+
+  /* Disabled state for transcription UI */
+  .disabled-ui { opacity: 0.5; pointer-events: none; filter: grayscale(1); }
 
   .row2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
   .chips{display:flex;flex-wrap:wrap;gap:8px;}
@@ -379,6 +392,15 @@
 
     <div class="serverline"><span class="dot"></span> Key held server-side · routed through this site</div>
 
+    <div class="auth-section signed-out" id="auth-section">
+      <div id="google_btn"></div>
+      <div class="user-info" id="user_info">
+        <span><span style="color:var(--muted)">Signed in as</span> <span class="user-email" id="user_email"></span></span>
+        <button class="sign-out" id="sign_out_btn">Sign out</button>
+      </div>
+    </div>
+
+    <div id="ui_container" class="disabled-ui">
     <div class="row2">
       <div class="field">
         <label class="cap" for="model">Model</label>
@@ -431,6 +453,7 @@
 
     <button class="go" id="go" disabled>Transcribe</button>
     <div class="status" id="status">Idle — add a file to begin.</div>
+    </div>
   </section>
 
   <section class="paper">
@@ -449,6 +472,69 @@
 <script>
 (function(){
   "use strict";
+
+  // =====================================================================
+  // CONFIGURATION
+  // =====================================================================
+  // Replace with your Google OAuth 2.0 Client ID
+  const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID_HERE";
+  // =====================================================================
+
+  let idToken = null;
+
+  window.onGoogleLibraryLoad = function() {
+    google.accounts.id.initialize({
+      client_id: GOOGLE_CLIENT_ID,
+      callback: handleCredentialResponse
+    });
+    google.accounts.id.renderButton(
+      document.getElementById("google_btn"),
+      { theme: "outline", size: "large", text: "continue_with" }
+    );
+  };
+
+  function parseJwt(token) {
+    try {
+      // Fix for Base64URL encoding (replace - with +, _ with /)
+      const base64Url = token.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      return JSON.parse(atob(base64));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function handleCredentialResponse(response) {
+    idToken = response.credential;
+    const payload = parseJwt(idToken);
+    if (payload && payload.email) {
+      document.getElementById("user_email").textContent = payload.email;
+      document.getElementById("google_btn").style.display = "none";
+      document.getElementById("user_info").classList.add("active");
+      document.getElementById("auth-section").classList.remove("signed-out");
+      document.getElementById("auth-section").classList.add("signed-in");
+      enableUI();
+    }
+  }
+
+  function signOut() {
+    idToken = null;
+    document.getElementById("user_email").textContent = "";
+    document.getElementById("google_btn").style.display = "block";
+    document.getElementById("user_info").classList.remove("active");
+    document.getElementById("auth-section").classList.add("signed-out");
+    document.getElementById("auth-section").classList.remove("signed-in");
+    disableUI();
+  }
+
+  function disableUI() {
+    document.getElementById("ui_container").classList.add("disabled-ui");
+  }
+
+  function enableUI() {
+    document.getElementById("ui_container").classList.remove("disabled-ui");
+  }
+
   const $=id=>document.getElementById(id);
   const modelEl=$("model"),fileEl=$("file"),drop=$("drop"),go=$("go"),
         statusEl=$("status"),out=$("out"),promptEl=$("prompt"),wave=$("wave"),meter=$("meter");
@@ -505,6 +591,8 @@
       (tokens?"<span>~TOKENS <b>"+tokens.toLocaleString()+"</b></span>":"");
     drop.classList.add("loaded"); setStatus("Ready to transcribe.","ok"); ready();
   }
+  $("sign_out_btn").addEventListener("click", signOut);
+
   fileEl.addEventListener("change",e=>intake(e.target.files[0]));
   ["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("hot");}));
   ["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("hot");}));
@@ -535,8 +623,20 @@
 
     const t0=performance.now();
     try{
-      const res=await fetch("/api/transcribe",{method:"POST",body:fd});
+      const res=await fetch("/api/transcribe",{
+        method:"POST",
+        headers: {
+          "Authorization": "Bearer " + idToken
+        },
+        body:fd
+      });
       const data=await res.json();
+      if(res.status === 401 || res.status === 403) {
+        signOut();
+        setStatus(data.error || "Session expired or unauthorized. Please sign in again.", "err");
+        go.disabled=false; wave.classList.remove("run"); ready();
+        return;
+      }
       if(!res.ok) throw new Error(data.error||("HTTP "+res.status));
       render(data.text); window.__transcript=data.text;
       const secs=((performance.now()-t0)/1000).toFixed(1);
